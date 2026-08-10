@@ -1,0 +1,22 @@
+# Dados financeiros pessoais (extratos/faturas reais do BB)
+OUROCARD_PLATINUM_ESTILO_VISA*.txt
+resultado_leitura.txt
+
+# Relatórios gerados (contêm dados financeiros reais)
+Fatura_*.xlsx
+
+# Capturas de tela da fatura real
+prints_fatura/
+prints_fatura_validacao/
+
+# Scripts antigos, superados pelo validador_fatura_mestre.py
+automacao_inteligente.py
+capturador_fatura.py
+extrator.py
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Config do editor
+.vscode/
