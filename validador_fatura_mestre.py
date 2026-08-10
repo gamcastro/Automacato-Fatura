@@ -3,7 +3,6 @@ import pyautogui
 import time
 import os
 import cv2
-import numpy as np
 import pytesseract
 import re
 import pandas as pd
@@ -21,6 +20,11 @@ SPI_SETMOUSE = 0x0004
 # deste conjunto (ex.: "1844", "1200", "8155") é ruído de leitura, não um cartão novo —
 # rejeitar em vez de aceitar evita reconciliar um item com um cartão que não existe.
 CARTOES_VALIDOS = {"0808", "1555", "4025", "8442"}
+
+# "teclado" (seta up/down) ou "mouse" (arrasto). Confirmado pelo usuário que teclado rola
+# sem o "rola demais" do fling do arrasto. Trocar aqui para reverter caso precise — o
+# código de arrasto de mouse continua intacto em rolar_e_processar_pagina().
+MODO_ROLAGEM = "teclado"
 
 def obter_configuracao_mouse():
     valores = (ctypes.c_int * 3)()
@@ -228,19 +232,47 @@ def rolar_e_processar_pagina(janela_app, pasta_prints, pag_num, lista_controle, 
 
     return resultado
 
-def varrer_lista(janela_app, pasta_prints, lista_controle, total_compras, centro_x, direcao, pag_inicial, max_paginas):
-    """ Percorre a lista rolando na direção indicada, reconciliando o que conseguir a
-    cada página. Só desiste quando a tela para de mudar E nenhum item novo aparece por
-    páginas seguidas — território já reconciliado numa rodada anterior ainda muda de tela
-    a cada rolagem mesmo sem achar item novo, então isso sozinho não pode contar como
-    "chegou numa ponta da lista" (foi exatamente essa confusão que fazia as rodadas
-    desistirem cedo demais, logo depois de escapar de um limite, sem chegar aos itens
-    realmente pendentes no meio da lista). """
+def garantir_foco_janela(janela_app):
+    """ pyautogui.press() manda a tecla para qualquer janela que estiver em foco no Windows
+    naquele instante — diferente do arrasto de mouse, que clica nas coordenadas da janela e
+    a foca de novo a cada vez. Se o usuário clicar em qualquer outra janela (ex.: no VS Code,
+    lendo o chat) enquanto o script roda, as setas param de chegar no Ourocard: a tela fica
+    parada de verdade e o script conclui "fim da lista" bem cedo, sem ter rolado nada.
+    Reforçar o foco antes de cada tentativa de tecla evita isso. """
+    try:
+        if janela_app.isMinimized:
+            janela_app.restore()
+        janela_app.activate()
+        time.sleep(0.1)
+    except Exception:
+        pass
+
+def rolar_teclado_e_processar(janela_app, pasta_prints, pag_num, lista_controle, direcao, repeticoes=3, atraso=0.15):
+    """ Rola com a seta do teclado (down/up) em vez de arrasto de mouse — confirmado pelo
+    usuário que não sofre da rolagem excessiva por inércia (fling) que o arrasto tinha.
+    Só teclas de seta, nunca um clique: um clique em algum item da lista abriria o detalhe
+    do lançamento em vez de rolar a lista. """
+    garantir_foco_janela(janela_app)
+    tecla = "down" if direcao == "frente" else "up"
+    for _ in range(repeticoes):
+        pyautogui.press(tecla)
+        time.sleep(atraso)
+    # Pequena pausa para o app espelhado renderizar a posição final antes do print.
+    time.sleep(0.3)
+    return processar_pagina_atual(janela_app, pasta_prints, pag_num, lista_controle)
+
+def varrer_lista(janela_app, pasta_prints, lista_controle, total_compras, centro_x, direcao, pag_inicial, max_paginas, paciencia=5):
+    """ Percorre a lista rolando na direção indicada, reconciliando o que conseguir a cada
+    página. Desiste depois de `paciencia` páginas seguidas sem nenhum item novo — mesmo
+    critério simples do ajuste fino via teclado (`ajuste_fino_teclado()`), que na prática se
+    mostrou mais confiável que comparar pixels entre capturas. A comparação de pixels
+    ("tela parada") funcionava para o arrasto de mouse (passos grandes, ~60% da altura da
+    janela), mas com o teclado cada toque de seta move pouco: a diferença de pixels entre
+    duas capturas fica pequena mesmo com progresso genuíno, então esse critério declarava
+    "fim da lista" cedo demais — só 2 páginas sem match já bastava, mesmo rolando de verdade. """
     paginas_sem_progresso = 0
     paginas_nao_reconhecidas = 0
     pag_num = pag_inicial
-    cinza_anterior = None
-    limiar_tela_parada = 3.0
 
     for indice_pagina in range(max_paginas):
         pag_num += 1
@@ -249,9 +281,12 @@ def varrer_lista(janela_app, pasta_prints, lista_controle, total_compras, centro
         if indice_pagina == 0:
             # Primeira página da rodada: a tela já está na posição certa (herdada da
             # rodada/página anterior), não precisa rolar antes de capturar.
-            cinza_atual, tela_reconhecida = processar_pagina_atual(janela_app, pasta_prints, pag_num, lista_controle)
+            _, tela_reconhecida = processar_pagina_atual(janela_app, pasta_prints, pag_num, lista_controle)
+        elif MODO_ROLAGEM == "teclado":
+            _, tela_reconhecida = rolar_teclado_e_processar(
+                janela_app, pasta_prints, pag_num, lista_controle, direcao)
         else:
-            cinza_atual, tela_reconhecida = rolar_e_processar_pagina(
+            _, tela_reconhecida = rolar_e_processar_pagina(
                 janela_app, pasta_prints, pag_num, lista_controle, centro_x, direcao)
         compras_depois = contar_reconciliadas(lista_controle)
 
@@ -261,7 +296,7 @@ def varrer_lista(janela_app, pasta_prints, lista_controle, total_compras, centro
             # a MESMA tela (sem rolar) e tenta de novo — uma chance extra barata.
             time.sleep(1.0)
             pag_num += 1
-            cinza_atual, tela_reconhecida = processar_pagina_atual(janela_app, pasta_prints, pag_num, lista_controle)
+            _, tela_reconhecida = processar_pagina_atual(janela_app, pasta_prints, pag_num, lista_controle)
             compras_depois = contar_reconciliadas(lista_controle)
 
         # Se a tela parar de parecer a lista de lançamentos (sem "Ourocard"/"Platinum"/
@@ -280,20 +315,14 @@ def varrer_lista(janela_app, pasta_prints, lista_controle, total_compras, centro
         if compras_depois >= total_compras:
             break
 
-        tela_parada = False
-        if cinza_anterior is not None and cinza_atual.shape == cinza_anterior.shape:
-            diferenca = float(np.abs(cinza_atual.astype(np.int16) - cinza_anterior.astype(np.int16)).mean())
-            tela_parada = diferenca < limiar_tela_parada
-        cinza_anterior = cinza_atual
-
-        if compras_depois == compras_antes and tela_parada:
+        if compras_depois == compras_antes:
             paginas_sem_progresso += 1
         else:
             paginas_sem_progresso = 0
 
-        if paginas_sem_progresso >= 2:
-            print(f"\n[Aviso] Fim da lista alcançado rolando '{direcao}' (tela parada e sem "
-                  f"item novo por {paginas_sem_progresso} páginas seguidas).")
+        if paginas_sem_progresso >= paciencia:
+            print(f"\n[Aviso] Fim da lista alcançado rolando '{direcao}' (nenhum item novo em "
+                  f"{paginas_sem_progresso} páginas seguidas).")
             break
 
     return pag_num
@@ -315,6 +344,7 @@ def ajuste_fino_teclado(janela_app, pasta_prints, lista_controle, total_compras,
         for _ in range(15):
             compras_antes = contar_reconciliadas(lista_controle)
 
+            garantir_foco_janela(janela_app)
             for _ in range(3):
                 pyautogui.press(tecla)
                 time.sleep(0.15)
@@ -420,9 +450,11 @@ def executar_fluxo_reconciliacao():
     if not os.path.exists(pasta_prints):
         os.makedirs(pasta_prints)
 
-    print("[Passo 2 Iniciado] Capturando telas com rolagem estendida (arrasto de mouse)...")
+    print(f"[Passo 2 Iniciado] Capturando telas com rolagem estendida (modo: {MODO_ROLAGEM})...")
 
-    max_paginas = 35  # Páginas abundantes para cobrir com folga todos os 49 itens
+    # O teclado avança bem menos por passo do que o arrasto de mouse (para o qual esse teto
+    # foi calibrado originalmente), então precisa de mais páginas para cobrir a lista inteira.
+    max_paginas = 60
     centro_x = janela_app.left + (janela_app.width // 2)
 
     # A aceleração de ponteiro do Windows distorce a sequência de micro-movimentos relativos
